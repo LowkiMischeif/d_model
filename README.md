@@ -1,6 +1,6 @@
-# Quant-Circuit
+# EdgeAlign
 
-Quant-Circuit is a Rust CLI for probing how f32 versus f16 execution changes internal attention circuits in Pythia-70M. It asks which attention heads are most important for next-token task performance, which heads drift under reduced precision, and whether restoring selected full-precision activations repairs the quantized run.
+EdgeAlign is a Rust CLI for probing how f32 versus f16 execution changes internal attention circuits in Pythia-70M. It asks which attention heads are most important for next-token task performance, which heads drift under reduced precision, and whether restoring selected full-precision activations repairs the quantized run.
 
 ## Requirements
 
