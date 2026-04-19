@@ -1,0 +1,36 @@
+{
+  "factual": [
+    { "prompt": "The Eiffel Tower is located in", "target": " Paris" },
+    { "prompt": "The capital of Japan is", "target": " Tokyo" },
+    { "prompt": "The CEO of Tesla is", "target": " Elon" },
+    { "prompt": "Python was created by", "target": " Guido" },
+    { "prompt": "The largest planet in the solar system is", "target": " Jupiter" },
+    { "prompt": "The color of the sky is", "target": " blue" },
+    { "prompt": "1 + 1 =", "target": " 2" },
+    { "prompt": "Water freezes at zero degrees", "target": " Celsius" }
+  ],
+  "ioi": [
+    { "prompt": "When Mary and John went to the store, John gave a drink to", "target": " Mary" },
+    { "prompt": "After Alice and Bob finished dinner, Alice passed the bill to", "target": " Bob" },
+    { "prompt": "When Sarah and Tom arrived at the park, Tom handed the ball to", "target": " Sarah" },
+    { "prompt": "After Emma and James left the office, James sent an email to", "target": " Emma" },
+    { "prompt": "When Lisa and David entered the room, David showed the painting to", "target": " Lisa" }
+  ],
+  "reference": [
+    "The weather today is expected to be",
+    "In a recent study, researchers found that",
+    "The history of mathematics begins with",
+    "She walked into the room and noticed",
+    "According to the latest reports,",
+    "One of the most important factors in",
+    "The development of new technologies has",
+    "During the meeting, the team discussed",
+    "It is widely believed that the best approach",
+    "The experiment was designed to test whether",
+    "In many countries around the world,",
+    "The relationship between these two variables",
+    "After careful consideration of the evidence,",
+    "The main advantage of this method is",
+    "Recent advances in machine learning have"
+  ]
+}
