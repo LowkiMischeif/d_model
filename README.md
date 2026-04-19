@@ -1,6 +1,6 @@
 # Edge Align
 
-EdgeAlign is a Rust CLI for probing how f32 versus f16 execution changes internal attention circuits in Pythia-70M. It asks which attention heads are most important for next-token task performance, which heads drift under reduced precision, and whether restoring selected full-precision activations repairs the quantized run.
+Edge Align is a Rust CLI that tests how f32 vs f16 vs int8 precision affects attention behavior in Pythia-70M. It identifies which attention heads matter most for next-token prediction, which ones degrade under lower precision, and whether restoring selected heads to full precision improves performance.
 
 ## Requirements
 
@@ -66,9 +66,3 @@ The hook is inserted after each attention output projection and before the resid
 The public `EleutherAI/pythia-70m` checkpoint is distributed as half-precision safetensors. The f32 run loads those weights into f32 tensors, so the comparison isolates dtype/activation arithmetic effects available from the public checkpoint rather than recovering unavailable original f32 training weights.
 
 The JSON schema keeps the original f32/f16 fields and adds optional INT8 fields: `drift_f32_int8`, `cosine_sim_f32_int8`, `clean_logit_diff_int8`, and top-level `repair_int8`. Existing plots still read the original f32/f16 fields.
-
-
-
-## License
-
-MIT
