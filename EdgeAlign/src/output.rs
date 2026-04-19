@@ -17,6 +17,7 @@ pub struct ExperimentOutput {
     pub num_heads: usize,
     pub prompts: Vec<PromptResult>,
     pub repair: Vec<RepairResult>,
+    pub repair_int8: Vec<RepairResult>,
     pub mean_activation_reference_count: usize,
     pub metadata: Metadata,
 }
@@ -31,8 +32,11 @@ pub struct PromptResult {
     pub mean_importance: Vec<Vec<f32>>,
     pub drift_f32_f16: Vec<Vec<f32>>,
     pub cosine_sim_f32_f16: Vec<Vec<f32>>,
+    pub drift_f32_int8: Option<Vec<Vec<f32>>>,
+    pub cosine_sim_f32_int8: Option<Vec<Vec<f32>>>,
     pub clean_logit_diff_f32: f32,
     pub clean_logit_diff_f16: f32,
+    pub clean_logit_diff_int8: Option<f32>,
 }
 
 /// Run-level bookkeeping that helps interpret or reproduce the output.
@@ -40,6 +44,7 @@ pub struct PromptResult {
 pub struct Metadata {
     pub timestamp: String,
     pub device: String,
+    pub int8_mode: Option<String>,
     pub total_forward_passes: usize,
     pub total_runtime_seconds: f32,
 }

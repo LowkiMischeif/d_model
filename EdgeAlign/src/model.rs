@@ -8,13 +8,49 @@ use anyhow::{bail, Context, Result};
 use candle::{DType, Device, Module, Tensor, D};
 use candle_nn::{embedding, linear_b, Embedding, LayerNorm, Linear, VarBuilder};
 use hf_hub::api::sync::Api;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokenizers::Tokenizer;
 
 pub const NUM_LAYERS: usize = 6;
 pub const NUM_HEADS: usize = 8;
 pub const HEAD_DIM: usize = 64;
 pub const HIDDEN_DIM: usize = NUM_HEADS * HEAD_DIM;
+
+/// Model precision mode used by the experiment.
+///
+/// `Int8` is intentionally not reported as native Candle INT8 weight inference.
+/// The current Pythia path loads safetensors through regular Candle tensors, so
+/// `Int8` means f32 weights plus dynamic fake-quantized activations. See
+/// `fake_quantize_int8_activation` for the exact approximation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub enum Precision {
+    F32,
+    F16,
+    Int8,
+}
+
+impl Precision {
+    /// Candle dtype used to load model weights for this precision mode.
+    pub fn load_dtype(self) -> DType {
+        match self {
+            Self::F32 | Self::Int8 => DType::F32,
+            Self::F16 => DType::F16,
+        }
+    }
+
+    /// Stable lowercase label used in JSON and progress logs.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::F32 => "f32",
+            Self::F16 => "f16",
+            Self::Int8 => "int8",
+        }
+    }
+
+    fn uses_fake_int8(self) -> bool {
+        matches!(self, Self::Int8)
+    }
+}
 
 /// Activations captured from one model forward pass.
 ///
@@ -51,6 +87,7 @@ pub struct HookedPythia {
     tokenizer: Tokenizer,
     device: Device,
     dtype: DType,
+    precision: Precision,
     pub num_layers: usize,
     pub num_heads: usize,
     pub head_dim: usize,
@@ -58,7 +95,25 @@ pub struct HookedPythia {
 
 impl HookedPythia {
     /// Downloads model files from Hugging Face and loads them at the requested dtype.
+    ///
+    /// This keeps the original API intact for f32/f16 callers. Use
+    /// `load_precision` for the simulated INT8 path.
     pub fn load(model_id: &str, device: &Device, dtype: DType) -> Result<Self> {
+        let precision = match dtype {
+            DType::F16 => Precision::F16,
+            DType::F32 => Precision::F32,
+            other => bail!("unsupported Pythia load dtype {other:?}; use F32, F16, or load_precision(..., Precision::Int8)"),
+        };
+        Self::load_precision(model_id, device, precision)
+    }
+
+    /// Downloads model files and loads the requested precision mode.
+    ///
+    /// For `Precision::Int8`, this deliberately loads f32 weights and enables
+    /// fake activation quantization. Candle's quantized loader is GGUF/QTensor
+    /// oriented and does not directly load this safetensors GPT-NeoX checkpoint
+    /// as native int8 weights.
+    pub fn load_precision(model_id: &str, device: &Device, precision: Precision) -> Result<Self> {
         let api = Api::new().context("create Hugging Face Hub API")?;
         let repo = api.model(model_id.to_string());
         let weights = vec![repo
@@ -78,6 +133,7 @@ impl HookedPythia {
         config.validate()?;
 
         let tokenizer = Tokenizer::from_file(&tokenizer_file).map_err(anyhow::Error::msg)?;
+        let dtype = precision.load_dtype();
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&weights, dtype, device)? };
         let model = GptNeoXForCausalLM::load(vb, &config)?;
 
@@ -86,6 +142,7 @@ impl HookedPythia {
             tokenizer,
             device: device.clone(),
             dtype,
+            precision,
             num_layers: config.num_hidden_layers,
             num_heads: config.num_attention_heads,
             head_dim: config.hidden_size / config.num_attention_heads,
@@ -95,6 +152,22 @@ impl HookedPythia {
     /// Returns the dtype the model weights were loaded with.
     pub fn dtype(&self) -> DType {
         self.dtype
+    }
+
+    /// Stable lowercase precision label used in output records.
+    pub fn precision_label(&self) -> &'static str {
+        self.precision.label()
+    }
+
+    /// Human-readable note describing what this precision mode means.
+    pub fn precision_description(&self) -> &'static str {
+        match self.precision {
+            Precision::F32 => "native f32 Candle tensor execution",
+            Precision::F16 => "native f16 Candle tensor execution",
+            Precision::Int8 => {
+                "simulated dynamic activation int8: f32 weights, selected activations quantized to int8 levels and dequantized before continuing"
+            }
+        }
     }
 
     /// Returns the Candle device used for model execution.
@@ -138,12 +211,15 @@ impl HookedPythia {
 
     /// Runs a normal forward pass and returns all cached per-head activations.
     pub fn forward_with_cache(&self, input_ids: &Tensor) -> Result<ActivationCache> {
-        Ok(self.model.forward(input_ids, &[], true)?)
+        Ok(self.model.forward(input_ids, &[], true, self.precision)?)
     }
 
     /// Runs a forward pass with one or more attention-head replacements.
     pub fn forward_with_patches(&self, input_ids: &Tensor, patches: &[Patch]) -> Result<Tensor> {
-        Ok(self.model.forward(input_ids, patches, false)?.final_logits)
+        Ok(self
+            .model
+            .forward(input_ids, patches, false, self.precision)?
+            .final_logits)
     }
 
     /// Computes `correct_logit - best_other_logit`.
@@ -311,6 +387,7 @@ impl GptNeoXForCausalLM {
         input_ids: &Tensor,
         patches: &[Patch],
         cache_activations: bool,
+        precision: Precision,
     ) -> candle::Result<ActivationCache> {
         let (batch_size, seq_len) = input_ids.dims2()?;
         if batch_size != 1 {
@@ -318,6 +395,7 @@ impl GptNeoXForCausalLM {
         }
 
         let mut hidden_states = self.embed_in.forward(input_ids)?;
+        hidden_states = maybe_fake_quantize_int8_activation(&hidden_states, precision)?;
         let causal_mask = if seq_len <= 1 {
             None
         } else {
@@ -343,6 +421,7 @@ impl GptNeoXForCausalLM {
                 causal_mask.as_ref(),
                 patches,
                 &mut layer_cache,
+                precision,
             )?;
             if let Some(layer_cache) = layer_cache {
                 attn_out.push(layer_cache);
@@ -350,6 +429,7 @@ impl GptNeoXForCausalLM {
         }
 
         let hidden_states = self.final_layer_norm.forward(&hidden_states)?;
+        let hidden_states = maybe_fake_quantize_int8_activation(&hidden_states, precision)?;
         let last_hidden = hidden_states.narrow(1, seq_len - 1, 1)?;
         let final_logits = self
             .embed_out
@@ -406,13 +486,16 @@ impl GptNeoXLayer {
         causal_mask: Option<&Tensor>,
         patches: &[Patch],
         layer_cache: &mut Option<Vec<Tensor>>,
+        precision: Precision,
     ) -> candle::Result<Tensor> {
         // GPT-NeoX/Pythia uses parallel residuals: attention and MLP both read
         // from the original residual stream, so attention patches do not change
         // the same-layer MLP input.
         let attn_input = self.input_layernorm.forward(hidden_states)?;
         let mlp_input = self.post_attention_layernorm.forward(hidden_states)?;
-        let attn_output = self.attention.forward(&attn_input, causal_mask)?;
+        let attn_output = self
+            .attention
+            .forward(&attn_input, causal_mask, precision)?;
         let attn_output = handle_head_hooks(
             &attn_output,
             self.layer_idx,
@@ -421,9 +504,10 @@ impl GptNeoXLayer {
             NUM_HEADS,
             HEAD_DIM,
         )?;
-        let mlp_output = self.mlp.forward(&mlp_input)?;
+        let mlp_output = self.mlp.forward(&mlp_input, precision)?;
         let hidden_states = (hidden_states + &attn_output)?;
-        &hidden_states + &mlp_output
+        let hidden_states = (&hidden_states + &mlp_output)?;
+        maybe_fake_quantize_int8_activation(&hidden_states, precision)
     }
 }
 
@@ -465,6 +549,7 @@ impl GptNeoXAttention {
         &self,
         hidden_states: &Tensor,
         causal_mask: Option<&Tensor>,
+        precision: Precision,
     ) -> candle::Result<Tensor> {
         let (batch_size, seq_len, _) = hidden_states.dims3()?;
         let qkv = self.query_key_value.forward(hidden_states)?;
@@ -495,7 +580,8 @@ impl GptNeoXAttention {
             seq_len,
             self.num_heads * self.head_dim,
         ))?;
-        self.dense.forward(&attn_output)
+        let attn_output = self.dense.forward(&attn_output)?;
+        maybe_fake_quantize_int8_activation(&attn_output, precision)
     }
 
     /// Applies rotary embeddings to the rotary portion of query and key heads.
@@ -594,10 +680,44 @@ impl GptNeoXMlp {
     }
 
     /// Runs GELU MLP: hidden -> intermediate -> hidden.
-    fn forward(&self, xs: &Tensor) -> candle::Result<Tensor> {
+    fn forward(&self, xs: &Tensor, precision: Precision) -> candle::Result<Tensor> {
         let xs = self.dense_h_to_4h.forward(xs)?.gelu()?;
-        self.dense_4h_to_h.forward(&xs)
+        let xs = self.dense_4h_to_h.forward(&xs)?;
+        maybe_fake_quantize_int8_activation(&xs, precision)
     }
+}
+
+/// Applies the project's simulated INT8 activation quantization.
+///
+/// This is dynamic per-tensor symmetric fake quantization:
+/// 1. compute `scale = max(abs(x)) / 127`
+/// 2. round/clamp `x / scale` to the signed int8 range `[-127, 127]`
+/// 3. multiply by `scale` to dequantize back to a normal Candle float tensor
+///
+/// No int8 matmul kernels or int8 weight storage are used here. The goal is a
+/// reproducible fallback for circuit-level comparisons when native INT8
+/// safetensors inference is not available for this GPT-NeoX path.
+fn maybe_fake_quantize_int8_activation(
+    tensor: &Tensor,
+    precision: Precision,
+) -> candle::Result<Tensor> {
+    if !precision.uses_fake_int8() {
+        return Ok(tensor.clone());
+    }
+
+    let original_dtype = tensor.dtype();
+    let tensor_f32 = tensor.to_dtype(DType::F32)?;
+    let max_abs = tensor_f32.abs()?.max_all()?.to_scalar::<f32>()?;
+    if !max_abs.is_finite() || max_abs == 0.0 {
+        return Ok(tensor.clone());
+    }
+
+    let scale = (max_abs / 127.0).max(f32::MIN_POSITIVE);
+    ((&tensor_f32 / scale as f64)?
+        .round()?
+        .clamp(-127.0, 127.0)?
+        * scale as f64)?
+        .to_dtype(original_dtype)
 }
 
 /// Builds a boolean upper-triangular causal mask.

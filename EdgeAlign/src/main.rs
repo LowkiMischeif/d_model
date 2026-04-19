@@ -18,7 +18,7 @@ use std::time::Instant;
 
 use ablation::{compute_importance, compute_mean_activations, ImportanceResult};
 use drift::{compute_drift, DriftResult};
-use model::HookedPythia;
+use model::{HookedPythia, Precision};
 use output::{save_results, ExperimentOutput, Metadata, PromptResult};
 use repair::{compute_repair, RepairResult};
 
@@ -42,6 +42,30 @@ struct Args {
 
     #[arg(long)]
     use_all_prompts: bool,
+
+    /// Skip the simulated INT8 comparison path.
+    #[arg(long)]
+    disable_int8: bool,
+
+    /// Also run f32-activation repair on the simulated INT8 model.
+    #[arg(long)]
+    repair_int8: bool,
+
+    /// Benchmark clean forward-pass speed and exit without running experiments.
+    #[arg(long)]
+    benchmark_speed: bool,
+
+    /// Timed iterations for --benchmark-speed.
+    #[arg(long, default_value_t = 30)]
+    benchmark_iters: usize,
+
+    /// Untimed warmup iterations for --benchmark-speed.
+    #[arg(long, default_value_t = 3)]
+    benchmark_warmup: usize,
+
+    /// Prompt used by --benchmark-speed.
+    #[arg(long, default_value = "The Eiffel Tower is located in")]
+    benchmark_prompt: String,
 }
 
 /// Shape of `prompts.json`.
@@ -82,11 +106,41 @@ fn main() -> Result<()> {
         .with_context(|| format!("load {MODEL_ID} as f32"))?;
     let model_f16 = HookedPythia::load(MODEL_ID, &device, DType::F16)
         .with_context(|| format!("load {MODEL_ID} as f16"))?;
+    let model_int8 = if args.disable_int8 {
+        eprintln!("[load] simulated INT8 disabled by --disable-int8");
+        None
+    } else {
+        eprintln!(
+            "[load] native INT8 safetensors GPT-NeoX loading is not available in this Candle path; using simulated dynamic activation INT8"
+        );
+        match HookedPythia::load_precision(MODEL_ID, &device, Precision::Int8) {
+            Ok(model) => Some(model),
+            Err(err) => {
+                eprintln!("[load] warning: could not initialize simulated INT8 model: {err:#}");
+                None
+            }
+        }
+    };
     eprintln!(
         "[load] loaded {MODEL_ID} as {:?} and {:?}",
         model_f32.dtype(),
         model_f16.dtype()
     );
+    if let Some(model_int8) = &model_int8 {
+        eprintln!("[load] INT8 mode: {}", model_int8.precision_description());
+    }
+
+    if args.benchmark_speed {
+        benchmark_speed(
+            &model_f32,
+            &model_f16,
+            model_int8.as_ref(),
+            &args.benchmark_prompt,
+            args.benchmark_warmup,
+            args.benchmark_iters,
+        )?;
+        return Ok(());
+    }
 
     // Validation filters out prompts where the model does not put the expected
     // token at top-1. Pythia-70M is weak, so the fallback prevents empty output.
@@ -187,32 +241,78 @@ fn main() -> Result<()> {
     // prompt's zero-ablation ranking.
     let mut prompt_results = Vec::<PromptResult>::new();
     let mut repair_results = Vec::<RepairResult>::new();
+    let mut repair_int8_results = Vec::<RepairResult>::new();
     for (idx, (prompt, importance)) in importance_results.iter().enumerate() {
         let drift_started = Instant::now();
-        let drift = match compute_drift(&model_f32, &model_f16, &prompt.prompt, &prompt.task_type) {
-            Ok(result) => {
-                total_forward_passes += 2;
-                eprintln!(
-                    "[drift] prompt {}/{}: {:?} done ({:.2}s)",
-                    idx + 1,
-                    importance_results.len(),
-                    short_prompt(&prompt.prompt),
-                    drift_started.elapsed().as_secs_f32()
-                );
-                result
+        let drift_f16 =
+            match compute_drift(&model_f32, &model_f16, &prompt.prompt, &prompt.task_type) {
+                Ok(result) => {
+                    total_forward_passes += 2;
+                    eprintln!(
+                        "[drift:f16] prompt {}/{}: {:?} done ({:.2}s)",
+                        idx + 1,
+                        importance_results.len(),
+                        short_prompt(&prompt.prompt),
+                        drift_started.elapsed().as_secs_f32()
+                    );
+                    result
+                }
+                Err(err) => {
+                    eprintln!(
+                        "[drift] warning: skipped {:?}: {err:#}",
+                        short_prompt(&prompt.prompt)
+                    );
+                    continue;
+                }
+            };
+
+        let drift_int8 = if let Some(model_int8) = &model_int8 {
+            let drift_started = Instant::now();
+            match compute_drift(&model_f32, model_int8, &prompt.prompt, &prompt.task_type) {
+                Ok(result) => {
+                    total_forward_passes += 2;
+                    eprintln!(
+                        "[drift:int8] prompt {}/{}: {:?} done ({:.2}s)",
+                        idx + 1,
+                        importance_results.len(),
+                        short_prompt(&prompt.prompt),
+                        drift_started.elapsed().as_secs_f32()
+                    );
+                    Some(result)
+                }
+                Err(err) => {
+                    eprintln!(
+                        "[drift:int8] warning: skipped {:?}: {err:#}",
+                        short_prompt(&prompt.prompt)
+                    );
+                    None
+                }
             }
-            Err(err) => {
-                eprintln!(
-                    "[drift] warning: skipped {:?}: {err:#}",
-                    short_prompt(&prompt.prompt)
-                );
-                continue;
+        } else {
+            None
+        };
+
+        let clean_logit_diff_int8 = if let Some(model_int8) = &model_int8 {
+            match compute_clean_logit_diff(model_int8, &prompt.prompt, prompt.target_token_id) {
+                Ok(value) => {
+                    total_forward_passes += 1;
+                    Some(value)
+                }
+                Err(err) => {
+                    eprintln!(
+                        "[clean:int8] warning: skipped {:?}: {err:#}",
+                        short_prompt(&prompt.prompt)
+                    );
+                    None
+                }
             }
+        } else {
+            None
         };
 
         let ranking = importance_ranking(&importance.zero_importance);
         let repair_started = Instant::now();
-        let repair = match compute_repair(
+        let repair_f16 = match compute_repair(
             &model_f32,
             &model_f16,
             &prompt.prompt,
@@ -224,7 +324,7 @@ fn main() -> Result<()> {
             Ok(result) => {
                 total_forward_passes += 2 + args.max_repair_k.min(ranking.len());
                 eprintln!(
-                    "[repair] prompt {}/{}: {:?} done ({:.2}s)",
+                    "[repair:f16] prompt {}/{}: {:?} done ({:.2}s)",
                     idx + 1,
                     importance_results.len(),
                     short_prompt(&prompt.prompt),
@@ -241,8 +341,56 @@ fn main() -> Result<()> {
             }
         };
 
-        prompt_results.push(to_prompt_result(prompt, importance, &drift, &repair));
-        repair_results.push(repair);
+        let repair_int8 = if args.repair_int8 {
+            if let Some(model_int8) = &model_int8 {
+                let repair_started = Instant::now();
+                match compute_repair(
+                    &model_f32,
+                    model_int8,
+                    &prompt.prompt,
+                    prompt.target_token_id,
+                    &prompt.task_type,
+                    &ranking,
+                    args.max_repair_k,
+                ) {
+                    Ok(result) => {
+                        total_forward_passes += 2 + args.max_repair_k.min(ranking.len());
+                        eprintln!(
+                            "[repair:int8] prompt {}/{}: {:?} done ({:.2}s)",
+                            idx + 1,
+                            importance_results.len(),
+                            short_prompt(&prompt.prompt),
+                            repair_started.elapsed().as_secs_f32()
+                        );
+                        Some(result)
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "[repair:int8] warning: skipped {:?}: {err:#}",
+                            short_prompt(&prompt.prompt)
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        prompt_results.push(to_prompt_result(
+            prompt,
+            importance,
+            &drift_f16,
+            drift_int8.as_ref(),
+            &repair_f16,
+            clean_logit_diff_int8,
+        ));
+        repair_results.push(repair_f16);
+        if let Some(repair_int8) = repair_int8 {
+            repair_int8_results.push(repair_int8);
+        }
     }
 
     let output = ExperimentOutput {
@@ -251,10 +399,14 @@ fn main() -> Result<()> {
         num_heads: model_f32.num_heads,
         prompts: prompt_results,
         repair: repair_results,
+        repair_int8: repair_int8_results,
         mean_activation_reference_count: prompt_data.reference.len(),
         metadata: Metadata {
             timestamp: chrono::Utc::now().to_rfc3339(),
             device: device_label(&device),
+            int8_mode: model_int8
+                .as_ref()
+                .map(|model| model.precision_description().to_string()),
             total_forward_passes,
             total_runtime_seconds: started.elapsed().as_secs_f32(),
         },
@@ -417,6 +569,89 @@ fn target_token_id(model: &HookedPythia, target: &str) -> Result<u32> {
     Ok(ids[0])
 }
 
+/// Runs one clean pass and computes the target-token logit difference.
+fn compute_clean_logit_diff(
+    model: &HookedPythia,
+    prompt: &str,
+    target_token_id: u32,
+) -> Result<f32> {
+    let input_ids = model.tokenize(prompt)?;
+    let cache = model.forward_with_cache(&input_ids)?;
+    model.logit_diff(&cache.final_logits, target_token_id)
+}
+
+/// Measures clean logits-only forward speed for available precision modes.
+///
+/// This intentionally calls `forward_with_patches(..., &[])` instead of
+/// `forward_with_cache` so the timing measures normal next-token inference and
+/// does not include the extra cost of saving all attention-head activations.
+fn benchmark_speed(
+    model_f32: &HookedPythia,
+    model_f16: &HookedPythia,
+    model_int8: Option<&HookedPythia>,
+    prompt: &str,
+    warmup_iters: usize,
+    timed_iters: usize,
+) -> Result<()> {
+    if timed_iters == 0 {
+        bail!("--benchmark-iters must be greater than zero");
+    }
+
+    println!("Speed benchmark prompt: {prompt:?}");
+    println!("Warmup iterations: {warmup_iters}");
+    println!("Timed iterations: {timed_iters}");
+    println!();
+    println!(
+        "{:<18} {:>12} {:>12} {:>12}",
+        "precision", "total_s", "avg_ms", "tok/s"
+    );
+
+    benchmark_one_model("f32", model_f32, prompt, warmup_iters, timed_iters)?;
+    benchmark_one_model("f16", model_f16, prompt, warmup_iters, timed_iters)?;
+    if let Some(model_int8) = model_int8 {
+        benchmark_one_model(
+            "simulated int8",
+            model_int8,
+            prompt,
+            warmup_iters,
+            timed_iters,
+        )?;
+    } else {
+        println!("{:<18} unavailable", "simulated int8");
+    }
+    Ok(())
+}
+
+/// Runs warmup and timed forward passes for one model.
+fn benchmark_one_model(
+    label: &str,
+    model: &HookedPythia,
+    prompt: &str,
+    warmup_iters: usize,
+    timed_iters: usize,
+) -> Result<()> {
+    let input_ids = model.tokenize(prompt)?;
+    let token_count = input_ids.dim(1)?;
+
+    for _ in 0..warmup_iters {
+        let _ = model.forward_with_patches(&input_ids, &[])?;
+    }
+
+    let started = Instant::now();
+    for _ in 0..timed_iters {
+        let _ = model.forward_with_patches(&input_ids, &[])?;
+    }
+    let elapsed = started.elapsed().as_secs_f64();
+    let avg_ms = elapsed * 1000.0 / timed_iters as f64;
+    let tokens_per_second = token_count as f64 * timed_iters as f64 / elapsed;
+
+    println!(
+        "{:<18} {:>12.4} {:>12.3} {:>12.1}",
+        label, elapsed, avg_ms, tokens_per_second
+    );
+    Ok(())
+}
+
 /// Sorts all heads by descending zero-ablation importance for one prompt.
 fn importance_ranking(zero_importance: &[Vec<f32>]) -> Vec<(usize, usize)> {
     let mut scored = Vec::new();
@@ -436,8 +671,10 @@ fn importance_ranking(zero_importance: &[Vec<f32>]) -> Vec<(usize, usize)> {
 fn to_prompt_result(
     prompt: &ValidatedPrompt,
     importance: &ImportanceResult,
-    drift: &DriftResult,
-    repair: &RepairResult,
+    drift_f16: &DriftResult,
+    drift_int8: Option<&DriftResult>,
+    repair_f16: &RepairResult,
+    clean_logit_diff_int8: Option<f32>,
 ) -> PromptResult {
     PromptResult {
         prompt: prompt.prompt.clone(),
@@ -445,10 +682,13 @@ fn to_prompt_result(
         task_type: prompt.task_type.clone(),
         zero_importance: importance.zero_importance.clone(),
         mean_importance: importance.mean_importance.clone(),
-        drift_f32_f16: drift.relative_drift.clone(),
-        cosine_sim_f32_f16: drift.cosine_sim.clone(),
+        drift_f32_f16: drift_f16.relative_drift.clone(),
+        cosine_sim_f32_f16: drift_f16.cosine_sim.clone(),
+        drift_f32_int8: drift_int8.map(|drift| drift.relative_drift.clone()),
+        cosine_sim_f32_int8: drift_int8.map(|drift| drift.cosine_sim.clone()),
         clean_logit_diff_f32: importance.clean_logit_diff,
-        clean_logit_diff_f16: repair.baseline_logit_diff_quantized,
+        clean_logit_diff_f16: repair_f16.baseline_logit_diff_quantized,
+        clean_logit_diff_int8,
     }
 }
 
