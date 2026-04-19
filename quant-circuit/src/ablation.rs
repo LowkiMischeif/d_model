@@ -1,9 +1,19 @@
+//! Attention-head importance scoring.
+//!
+//! This module asks how much each head matters for a prompt by replacing one
+//! head at a time and measuring the drop in the target-token logit difference.
+
 use anyhow::{bail, Result};
 use candle::Tensor;
 use serde::Serialize;
 
 use crate::model::{tensor_to_vec_f32, HookedPythia, Patch, PatchValue};
 
+/// Importance scores for one prompt.
+///
+/// `zero_importance` and `mean_importance` both have shape
+/// `[num_layers][num_heads]`. Positive values mean the head was helpful:
+/// removing/replacing it lowered the target-token logit difference.
 #[derive(Clone, Debug, Serialize)]
 pub struct ImportanceResult {
     pub prompt: String,
@@ -14,6 +24,11 @@ pub struct ImportanceResult {
     pub mean_importance: Vec<Vec<f32>>,
 }
 
+/// Computes average reference activations used by mean-ablation.
+///
+/// Reference prompts have different lengths, so we average only each head's
+/// final-position vector. When used as a patch, the model code broadcasts that
+/// vector across the current prompt length.
 pub fn compute_mean_activations(
     model: &HookedPythia,
     reference_prompts: &[String],
@@ -26,10 +41,13 @@ pub fn compute_mean_activations(
     let mut count = 0usize;
 
     for prompt in reference_prompts {
+        // Cache every head activation for this neutral reference prompt.
         let input_ids = model.tokenize(prompt)?;
         let cache = model.forward_with_cache(&input_ids)?;
         for layer in 0..model.num_layers {
             for head in 0..model.num_heads {
+                // Use only the final token position so all reference prompts
+                // contribute same-sized vectors.
                 let activation = &cache.attn_out[layer][head];
                 let seq_len = activation.dim(0)?;
                 let last = activation.narrow(0, seq_len - 1, 1)?.squeeze(0)?;
@@ -60,6 +78,10 @@ pub fn compute_mean_activations(
     Ok(means)
 }
 
+/// Computes zero-ablation and mean-ablation importance for one prompt.
+///
+/// The clean logit difference is measured once. Then each head is patched in
+/// isolation, and importance is `clean_logit_diff - patched_logit_diff`.
 pub fn compute_importance(
     model: &HookedPythia,
     prompt: &str,
@@ -74,6 +96,7 @@ pub fn compute_importance(
     let mut zero_importance = vec![vec![0f32; model.num_heads]; model.num_layers];
     let mut mean_importance = vec![vec![0f32; model.num_heads]; model.num_layers];
 
+    // Zero-ablation: replace one head with zeros and measure the damage.
     for layer in 0..model.num_layers {
         for head in 0..model.num_heads {
             let patch = Patch {
@@ -87,6 +110,7 @@ pub fn compute_importance(
         }
     }
 
+    // Mean-ablation: replace one head with its average reference activation.
     for layer in 0..model.num_layers {
         for head in 0..model.num_heads {
             let patch = Patch {

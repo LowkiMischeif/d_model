@@ -1,3 +1,9 @@
+//! CLI orchestration for the full quantization-circuit experiment.
+//!
+//! The binary loads prompts and two Pythia-70M instances, validates prompts,
+//! runs importance/drift/repair experiments, then writes one JSON file for the
+//! Python plotting script.
+
 mod ablation;
 mod drift;
 mod model;
@@ -18,6 +24,7 @@ use repair::{compute_repair, RepairResult};
 
 const MODEL_ID: &str = "EleutherAI/pythia-70m";
 
+/// Command-line options for the experiment runner.
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
 struct Args {
@@ -37,6 +44,7 @@ struct Args {
     use_all_prompts: bool,
 }
 
+/// Shape of `prompts.json`.
 #[derive(Debug, Deserialize)]
 struct PromptData {
     factual: Vec<LabeledPrompt>,
@@ -44,12 +52,14 @@ struct PromptData {
     reference: Vec<String>,
 }
 
+/// A prompt with the expected next-token text.
 #[derive(Clone, Debug, Deserialize)]
 struct LabeledPrompt {
     prompt: String,
     target: String,
 }
 
+/// A prompt that has been converted into the IDs needed for experiments.
 #[derive(Clone, Debug)]
 struct ValidatedPrompt {
     prompt: String,
@@ -58,6 +68,7 @@ struct ValidatedPrompt {
     task_type: String,
 }
 
+/// Runs the complete pipeline: load, validate, score, repair, and serialize.
 fn main() -> Result<()> {
     let args = Args::parse();
     let started = Instant::now();
@@ -77,6 +88,8 @@ fn main() -> Result<()> {
         model_f16.dtype()
     );
 
+    // Validation filters out prompts where the model does not put the expected
+    // token at top-1. Pythia-70M is weak, so the fallback prevents empty output.
     let mut factual = validate_prompts(
         &model_f32,
         &prompt_data.factual,
@@ -91,7 +104,9 @@ fn main() -> Result<()> {
     );
 
     if args.use_all_prompts {
-        eprintln!("[validate] --use-all-prompts set; keeping every prompt regardless of top-1 prediction");
+        eprintln!(
+            "[validate] --use-all-prompts set; keeping every prompt regardless of top-1 prediction"
+        );
         factual = prompts_without_top1_filter(&model_f32, &prompt_data.factual, "FactualRecall");
         ioi = prompts_without_top1_filter(&model_f32, &prompt_data.ioi, "IOI");
     } else {
@@ -126,6 +141,8 @@ fn main() -> Result<()> {
     validated.extend(factual);
     validated.extend(ioi);
 
+    // Mean activations are computed once and reused for every mean-ablation
+    // sweep. They are based on unrelated reference prompts.
     let mean_activations = compute_mean_activations(&model_f32, &prompt_data.reference)
         .context("compute mean activations")?;
     total_forward_passes += prompt_data.reference.len();
@@ -134,6 +151,8 @@ fn main() -> Result<()> {
         prompt_data.reference.len()
     );
 
+    // Importance is the expensive part: 1 clean pass + 48 zero patches + 48
+    // mean patches for each prompt.
     let mut importance_results = Vec::<(ValidatedPrompt, ImportanceResult)>::new();
     for (idx, prompt) in validated.iter().enumerate() {
         let step_started = Instant::now();
@@ -164,6 +183,8 @@ fn main() -> Result<()> {
         }
     }
 
+    // Drift and repair are run after importance because repair needs each
+    // prompt's zero-ablation ranking.
     let mut prompt_results = Vec::<PromptResult>::new();
     let mut repair_results = Vec::<RepairResult>::new();
     for (idx, (prompt, importance)) in importance_results.iter().enumerate() {
@@ -248,11 +269,15 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Loads and deserializes the prompt file.
 fn load_prompts(path: &str) -> Result<PromptData> {
     let file = std::fs::File::open(path).with_context(|| format!("open prompts file {path}"))?;
     serde_json::from_reader(file).with_context(|| format!("parse prompts file {path}"))
 }
 
+/// Converts the user's device choice into a Candle device.
+///
+/// `auto` prefers CUDA when Candle reports it is available, otherwise CPU.
 fn select_device(requested: &str) -> Result<Device> {
     match requested.to_ascii_lowercase().as_str() {
         "cpu" => Ok(Device::Cpu),
@@ -268,6 +293,7 @@ fn select_device(requested: &str) -> Result<Device> {
     }
 }
 
+/// Returns a compact device label for metadata and progress messages.
 fn device_label(device: &Device) -> String {
     if matches!(device, Device::Cpu) {
         "cpu".to_string()
@@ -276,6 +302,7 @@ fn device_label(device: &Device) -> String {
     }
 }
 
+/// Keeps only prompts whose target token is the f32 model's top-1 prediction.
 fn validate_prompts(
     model: &HookedPythia,
     prompts: &[LabeledPrompt],
@@ -322,6 +349,10 @@ fn validate_prompts(
     passed
 }
 
+/// Converts prompts into experiment inputs without checking top-1 correctness.
+///
+/// This is useful when strict validation would leave no data, which is common
+/// for small models on hand-written factual prompts.
 fn prompts_without_top1_filter(
     model: &HookedPythia,
     prompts: &[LabeledPrompt],
@@ -347,6 +378,7 @@ fn prompts_without_top1_filter(
     kept
 }
 
+/// Validates one prompt and returns both its experiment record and prediction.
 fn validate_one_prompt(
     model: &HookedPythia,
     item: &LabeledPrompt,
@@ -367,6 +399,10 @@ fn validate_one_prompt(
     ))
 }
 
+/// Converts a target string like `" Paris"` into the token ID being scored.
+///
+/// If the tokenizer splits a target into multiple tokens, the experiment uses
+/// the first token because the model predicts one next token at a time.
 fn target_token_id(model: &HookedPythia, target: &str) -> Result<u32> {
     let ids = model.encode_ids_with_special_tokens(target, false)?;
     if ids.is_empty() {
@@ -381,6 +417,7 @@ fn target_token_id(model: &HookedPythia, target: &str) -> Result<u32> {
     Ok(ids[0])
 }
 
+/// Sorts all heads by descending zero-ablation importance for one prompt.
 fn importance_ranking(zero_importance: &[Vec<f32>]) -> Vec<(usize, usize)> {
     let mut scored = Vec::new();
     for (layer, heads) in zero_importance.iter().enumerate() {
@@ -395,6 +432,7 @@ fn importance_ranking(zero_importance: &[Vec<f32>]) -> Vec<(usize, usize)> {
         .collect()
 }
 
+/// Combines the separate experiment outputs into the JSON prompt schema.
 fn to_prompt_result(
     prompt: &ValidatedPrompt,
     importance: &ImportanceResult,
@@ -414,6 +452,7 @@ fn to_prompt_result(
     }
 }
 
+/// Truncates long prompt text for readable stderr progress logs.
 fn short_prompt(prompt: &str) -> String {
     const LIMIT: usize = 72;
     if prompt.chars().count() <= LIMIT {

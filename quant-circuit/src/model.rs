@@ -1,3 +1,9 @@
+//! Hooked Pythia/GPT-NeoX model implementation.
+//!
+//! Candle does not expose a hook API for Pythia attention heads, so this file
+//! implements the small GPT-NeoX forward pass directly and inserts one hook:
+//! after the attention output projection and before the residual addition.
+
 use anyhow::{bail, Context, Result};
 use candle::{DType, Device, Module, Tensor, D};
 use candle_nn::{embedding, linear_b, Embedding, LayerNorm, Linear, VarBuilder};
@@ -10,12 +16,17 @@ pub const NUM_HEADS: usize = 8;
 pub const HEAD_DIM: usize = 64;
 pub const HIDDEN_DIM: usize = NUM_HEADS * HEAD_DIM;
 
+/// Activations captured from one model forward pass.
+///
+/// `attn_out[layer][head]` has shape `[seq_len, head_dim]`. `final_logits` is
+/// the next-token logits vector at the final sequence position.
 #[derive(Clone)]
 pub struct ActivationCache {
     pub attn_out: Vec<Vec<Tensor>>,
     pub final_logits: Tensor,
 }
 
+/// One surgical intervention at a specific `(layer, head)` site.
 #[derive(Clone)]
 pub struct Patch {
     pub layer: usize,
@@ -23,13 +34,18 @@ pub struct Patch {
     pub value: PatchValue,
 }
 
+/// The value used to replace a head's attention output.
 #[derive(Clone)]
 pub enum PatchValue {
+    /// Replace the head output with zeros.
     Zero,
+    /// Replace with a precomputed reference mean activation.
     Mean(Tensor),
+    /// Replace with another run's activation, used for f32-into-f16 repair.
     Replace(Tensor),
 }
 
+/// User-facing wrapper around the hooked Pythia model and tokenizer.
 pub struct HookedPythia {
     model: GptNeoXForCausalLM,
     tokenizer: Tokenizer,
@@ -41,6 +57,7 @@ pub struct HookedPythia {
 }
 
 impl HookedPythia {
+    /// Downloads model files from Hugging Face and loads them at the requested dtype.
     pub fn load(model_id: &str, device: &Device, dtype: DType) -> Result<Self> {
         let api = Api::new().context("create Hugging Face Hub API")?;
         let repo = api.model(model_id.to_string());
@@ -75,14 +92,17 @@ impl HookedPythia {
         })
     }
 
+    /// Returns the dtype the model weights were loaded with.
     pub fn dtype(&self) -> DType {
         self.dtype
     }
 
+    /// Returns the Candle device used for model execution.
     pub fn device(&self) -> &Device {
         &self.device
     }
 
+    /// Tokenizes text as a batch of size 1: shape `[1, seq_len]`.
     pub fn tokenize(&self, text: &str) -> Result<Tensor> {
         let ids = self.encode_ids(text)?;
         if ids.is_empty() {
@@ -91,10 +111,12 @@ impl HookedPythia {
         Ok(Tensor::new(ids.as_slice(), &self.device)?.unsqueeze(0)?)
     }
 
+    /// Encodes text using the tokenizer default of adding special tokens.
     pub fn encode_ids(&self, text: &str) -> Result<Vec<u32>> {
         self.encode_ids_with_special_tokens(text, true)
     }
 
+    /// Encodes text while explicitly controlling special-token insertion.
     pub fn encode_ids_with_special_tokens(
         &self,
         text: &str,
@@ -107,20 +129,26 @@ impl HookedPythia {
         Ok(enc.get_ids().to_vec())
     }
 
+    /// Decodes a single token ID for readable validation logs.
     pub fn decode_token(&self, token_id: u32) -> Result<String> {
         self.tokenizer
             .decode(&[token_id], true)
             .map_err(anyhow::Error::msg)
     }
 
+    /// Runs a normal forward pass and returns all cached per-head activations.
     pub fn forward_with_cache(&self, input_ids: &Tensor) -> Result<ActivationCache> {
         Ok(self.model.forward(input_ids, &[], true)?)
     }
 
+    /// Runs a forward pass with one or more attention-head replacements.
     pub fn forward_with_patches(&self, input_ids: &Tensor, patches: &[Patch]) -> Result<Tensor> {
         Ok(self.model.forward(input_ids, patches, false)?.final_logits)
     }
 
+    /// Computes `correct_logit - best_other_logit`.
+    ///
+    /// This is the scalar task metric used by ablation and repair.
     pub fn logit_diff(&self, logits: &Tensor, correct_token_id: u32) -> Result<f32> {
         let values = tensor_to_vec_f32(logits)?;
         let correct_idx = correct_token_id as usize;
@@ -139,6 +167,7 @@ impl HookedPythia {
         Ok(correct - best_other)
     }
 
+    /// Returns the highest-logit token ID.
     pub fn argmax_token(&self, logits: &Tensor) -> Result<u32> {
         let values = tensor_to_vec_f32(logits)?;
         let (idx, _) = values
@@ -150,6 +179,7 @@ impl HookedPythia {
     }
 }
 
+/// Converts any tensor to a CPU `Vec<f32>` for scalar metric calculations.
 pub fn tensor_to_vec_f32(tensor: &Tensor) -> Result<Vec<f32>> {
     Ok(tensor
         .to_dtype(DType::F32)?
@@ -158,6 +188,7 @@ pub fn tensor_to_vec_f32(tensor: &Tensor) -> Result<Vec<f32>> {
         .to_vec1::<f32>()?)
 }
 
+/// Subset of the Hugging Face GPT-NeoX config needed by Pythia-70M.
 #[derive(Debug, Clone, Deserialize)]
 struct GptNeoXConfig {
     hidden_size: usize,
@@ -173,9 +204,13 @@ struct GptNeoXConfig {
 }
 
 impl GptNeoXConfig {
+    /// Ensures the downloaded model matches the architecture assumed by hooks.
     fn validate(&self) -> Result<()> {
         if self.hidden_size != HIDDEN_DIM {
-            bail!("expected hidden_size {HIDDEN_DIM}, got {}", self.hidden_size);
+            bail!(
+                "expected hidden_size {HIDDEN_DIM}, got {}",
+                self.hidden_size
+            );
         }
         if self.num_attention_heads != NUM_HEADS {
             bail!(
@@ -196,26 +231,33 @@ impl GptNeoXConfig {
             bail!("max_position_embeddings must be positive");
         }
         if self.rotary_ndims() % 2 != 0 {
-            bail!("rotary dimensions must be even, got {}", self.rotary_ndims());
+            bail!(
+                "rotary dimensions must be even, got {}",
+                self.rotary_ndims()
+            );
         }
         Ok(())
     }
 
+    /// Per-head hidden size.
     fn head_dim(&self) -> usize {
         self.hidden_size / self.num_attention_heads
     }
 
+    /// Number of dimensions in each head that receive rotary embeddings.
     fn rotary_ndims(&self) -> usize {
         (self.head_dim() as f32 * self.rotary_pct) as usize
     }
 }
 
+/// Loads a layer norm from Hugging Face-style `weight` and `bias` tensors.
 fn layer_norm(size: usize, eps: f64, vb: VarBuilder) -> candle::Result<LayerNorm> {
     let weight = vb.get(size, "weight")?;
     let bias = vb.get(size, "bias")?;
     Ok(LayerNorm::new(weight, bias, eps))
 }
 
+/// Minimal GPT-NeoX causal language model for Pythia-70M.
 #[derive(Clone)]
 struct GptNeoXForCausalLM {
     embed_in: Embedding,
@@ -225,6 +267,7 @@ struct GptNeoXForCausalLM {
 }
 
 impl GptNeoXForCausalLM {
+    /// Loads embeddings, transformer blocks, final norm, and output head.
     fn load(vb: VarBuilder, config: &GptNeoXConfig) -> candle::Result<Self> {
         let embed_in = embedding(
             config.vocab_size,
@@ -258,6 +301,11 @@ impl GptNeoXForCausalLM {
         })
     }
 
+    /// Shared forward path used for clean, cached, and patched executions.
+    ///
+    /// `cache_activations` controls whether every attention head is saved.
+    /// `patches` controls whether selected heads are replaced before the
+    /// attention output is added to the residual stream.
     fn forward(
         &self,
         input_ids: &Tensor,
@@ -282,14 +330,20 @@ impl GptNeoXForCausalLM {
             Vec::new()
         };
 
+        // Each transformer block receives the same causal mask. No KV cache is
+        // used because experiments run full prompts rather than generation.
         for layer in &self.layers {
             let mut layer_cache = if cache_activations {
                 Some(Vec::with_capacity(NUM_HEADS))
             } else {
                 None
             };
-            hidden_states =
-                layer.forward(&hidden_states, causal_mask.as_ref(), patches, &mut layer_cache)?;
+            hidden_states = layer.forward(
+                &hidden_states,
+                causal_mask.as_ref(),
+                patches,
+                &mut layer_cache,
+            )?;
             if let Some(layer_cache) = layer_cache {
                 attn_out.push(layer_cache);
             }
@@ -297,7 +351,11 @@ impl GptNeoXForCausalLM {
 
         let hidden_states = self.final_layer_norm.forward(&hidden_states)?;
         let last_hidden = hidden_states.narrow(1, seq_len - 1, 1)?;
-        let final_logits = self.embed_out.forward(&last_hidden)?.squeeze(1)?.squeeze(0)?;
+        let final_logits = self
+            .embed_out
+            .forward(&last_hidden)?
+            .squeeze(1)?
+            .squeeze(0)?;
         Ok(ActivationCache {
             attn_out,
             final_logits,
@@ -305,6 +363,7 @@ impl GptNeoXForCausalLM {
     }
 }
 
+/// One Pythia transformer block: layer norms, attention, and MLP.
 #[derive(Clone)]
 struct GptNeoXLayer {
     layer_idx: usize,
@@ -315,6 +374,7 @@ struct GptNeoXLayer {
 }
 
 impl GptNeoXLayer {
+    /// Loads one transformer block from its `gpt_neox.layers.N` prefix.
     fn load(vb: VarBuilder, config: &GptNeoXConfig, layer_idx: usize) -> candle::Result<Self> {
         let input_layernorm = layer_norm(
             config.hidden_size,
@@ -337,6 +397,9 @@ impl GptNeoXLayer {
         })
     }
 
+    /// Runs a parallel-residual GPT-NeoX block.
+    ///
+    /// The hook is applied to `attn_output` before it is added to the residual.
     fn forward(
         &self,
         hidden_states: &Tensor,
@@ -364,6 +427,7 @@ impl GptNeoXLayer {
     }
 }
 
+/// Multi-head self-attention with GPT-NeoX QKV packing and rotary embeddings.
 #[derive(Clone)]
 struct GptNeoXAttention {
     query_key_value: Linear,
@@ -376,14 +440,11 @@ struct GptNeoXAttention {
 }
 
 impl GptNeoXAttention {
+    /// Loads the fused QKV projection and output projection.
     fn load(vb: VarBuilder, config: &GptNeoXConfig) -> candle::Result<Self> {
         let hidden_size = config.hidden_size;
-        let query_key_value = linear_b(
-            hidden_size,
-            3 * hidden_size,
-            true,
-            vb.pp("query_key_value"),
-        )?;
+        let query_key_value =
+            linear_b(hidden_size, 3 * hidden_size, true, vb.pp("query_key_value"))?;
         let dense = linear_b(hidden_size, hidden_size, true, vb.pp("dense"))?;
         let head_dim = config.head_dim();
         let rotary_ndims = config.rotary_ndims();
@@ -399,7 +460,12 @@ impl GptNeoXAttention {
         })
     }
 
-    fn forward(&self, hidden_states: &Tensor, causal_mask: Option<&Tensor>) -> candle::Result<Tensor> {
+    /// Computes attention output with shape `[batch, seq_len, hidden_dim]`.
+    fn forward(
+        &self,
+        hidden_states: &Tensor,
+        causal_mask: Option<&Tensor>,
+    ) -> candle::Result<Tensor> {
         let (batch_size, seq_len, _) = hidden_states.dims3()?;
         let qkv = self.query_key_value.forward(hidden_states)?;
         let qkv = qkv.reshape((batch_size, seq_len, self.num_heads, 3 * self.head_dim))?;
@@ -424,13 +490,15 @@ impl GptNeoXAttention {
 
         let attn_probs =
             candle_nn::ops::softmax(&attn_scores, D::Minus1)?.to_dtype(hidden_states.dtype())?;
-        let attn_output = attn_probs
-            .matmul(&value)?
-            .transpose(1, 2)?
-            .reshape((batch_size, seq_len, self.num_heads * self.head_dim))?;
+        let attn_output = attn_probs.matmul(&value)?.transpose(1, 2)?.reshape((
+            batch_size,
+            seq_len,
+            self.num_heads * self.head_dim,
+        ))?;
         self.dense.forward(&attn_output)
     }
 
+    /// Applies rotary embeddings to the rotary portion of query and key heads.
     fn apply_rotary(&self, query: &Tensor, key: &Tensor) -> candle::Result<(Tensor, Tensor)> {
         if self.rotary_ndims == 0 {
             return Ok((query.clone(), key.clone()));
@@ -455,12 +523,14 @@ impl GptNeoXAttention {
     }
 }
 
+/// Rotary embedding state for GPT-NeoX attention.
 #[derive(Clone)]
 struct RotaryEmbedding {
     inv_freq: Tensor,
 }
 
 impl RotaryEmbedding {
+    /// Builds inverse frequencies used to generate sin/cos position tables.
     fn new(rotary_ndims: usize, base: f32, device: &Device) -> candle::Result<Self> {
         let inv_freq: Vec<f32> = (0..rotary_ndims)
             .step_by(2)
@@ -471,6 +541,7 @@ impl RotaryEmbedding {
         })
     }
 
+    /// Rotates query and key tensors according to their sequence positions.
     fn forward(&self, query: &Tensor, key: &Tensor) -> candle::Result<(Tensor, Tensor)> {
         let (_, _, seq_len, rotary_ndims) = query.dims4()?;
         let dtype = query.dtype();
@@ -486,6 +557,7 @@ impl RotaryEmbedding {
     }
 }
 
+/// Implements the GPT-NeoX rotary helper: `[-x2, x1]`.
 fn rotate_half(xs: &Tensor) -> candle::Result<Tensor> {
     let last_dim = xs.dim(D::Minus1)?;
     let x1 = xs.narrow(D::Minus1, 0, last_dim / 2)?;
@@ -493,6 +565,7 @@ fn rotate_half(xs: &Tensor) -> candle::Result<Tensor> {
     Tensor::cat(&[&x2.neg()?, &x1], D::Minus1)
 }
 
+/// Feed-forward network inside each GPT-NeoX block.
 #[derive(Clone)]
 struct GptNeoXMlp {
     dense_h_to_4h: Linear,
@@ -500,6 +573,7 @@ struct GptNeoXMlp {
 }
 
 impl GptNeoXMlp {
+    /// Loads the up-projection and down-projection MLP weights.
     fn load(vb: VarBuilder, config: &GptNeoXConfig) -> candle::Result<Self> {
         let dense_h_to_4h = linear_b(
             config.hidden_size,
@@ -519,21 +593,23 @@ impl GptNeoXMlp {
         })
     }
 
+    /// Runs GELU MLP: hidden -> intermediate -> hidden.
     fn forward(&self, xs: &Tensor) -> candle::Result<Tensor> {
         let xs = self.dense_h_to_4h.forward(xs)?.gelu()?;
         self.dense_4h_to_h.forward(&xs)
     }
 }
 
+/// Builds a boolean upper-triangular causal mask.
 fn causal_mask(batch_size: usize, seq_len: usize, device: &Device) -> candle::Result<Tensor> {
     let mask: Vec<u8> = (0..seq_len)
         .flat_map(|i| (0..seq_len).map(move |j| u8::from(j > i)))
         .collect();
-    Tensor::from_slice(&mask, (seq_len, seq_len), device)?.broadcast_as((
-        batch_size, 1, seq_len, seq_len,
-    ))
+    Tensor::from_slice(&mask, (seq_len, seq_len), device)?
+        .broadcast_as((batch_size, 1, seq_len, seq_len))
 }
 
+/// Replaces entries selected by `mask` with `on_true`.
 fn masked_fill(on_false: &Tensor, mask: &Tensor, on_true: f32) -> candle::Result<Tensor> {
     let on_true = Tensor::new(on_true, on_false.device())?
         .to_dtype(on_false.dtype())?
@@ -541,6 +617,11 @@ fn masked_fill(on_false: &Tensor, mask: &Tensor, on_true: f32) -> candle::Result
     mask.where_cond(&on_true, on_false)
 }
 
+/// Caches and/or patches per-head attention outputs at the hook site.
+///
+/// The attention output arrives as `[1, seq_len, hidden_dim]`. This function
+/// reshapes it to `[1, seq_len, num_heads, head_dim]`, saves requested head
+/// slices, applies any patches for this layer, and reshapes back.
 fn handle_head_hooks(
     attn_output: &Tensor,
     layer_idx: usize,
@@ -560,12 +641,11 @@ fn handle_head_hooks(
     }
     let attn_heads = attn_output.reshape((batch_size, seq_len, num_heads, head_dim))?;
 
+    // Cache before patching so `forward_with_cache` records the model's natural
+    // activations, not any intervened values.
     if let Some(cache) = layer_cache {
         for head_idx in 0..num_heads {
-            let head = attn_heads
-                .narrow(2, head_idx, 1)?
-                .squeeze(2)?
-                .squeeze(0)?;
+            let head = attn_heads.narrow(2, head_idx, 1)?.squeeze(2)?.squeeze(0)?;
             cache.push(head);
         }
     }
@@ -574,6 +654,8 @@ fn handle_head_hooks(
         return Ok(attn_output.clone());
     }
 
+    // Candle tensors are immutable, so replacement is implemented by building a
+    // list of head tensors and concatenating them back together.
     let mut repaired_heads = Vec::with_capacity(num_heads);
     for head_idx in 0..num_heads {
         let original = attn_heads.narrow(2, head_idx, 1)?;
@@ -601,6 +683,7 @@ fn handle_head_hooks(
     Tensor::cat(&refs, 2)?.reshape((batch_size, seq_len, num_heads * head_dim))
 }
 
+/// Converts a patch enum into a concrete `[seq_len, head_dim]` tensor.
 fn patch_to_head_tensor(
     value: &PatchValue,
     seq_len: usize,
@@ -616,6 +699,10 @@ fn patch_to_head_tensor(
     }
 }
 
+/// Moves/casts a replacement tensor and broadcasts it to the current prompt.
+///
+/// Mean activations are stored as one vector, while repair activations are
+/// stored as full sequences. This helper accepts both shapes.
 fn normalize_patch_tensor(
     tensor: &Tensor,
     seq_len: usize,

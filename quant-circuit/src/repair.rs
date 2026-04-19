@@ -1,8 +1,18 @@
+//! Circuit repair experiment.
+//!
+//! This module restores selected f32 attention-head activations inside the f16
+//! forward pass. The repair curve shows how task performance changes as more
+//! top-ranked heads are restored.
+
 use anyhow::Result;
 use serde::Serialize;
 
 use crate::model::{HookedPythia, Patch, PatchValue};
 
+/// Per-prompt repair result.
+///
+/// `repair_curve[k - 1]` is the logit difference after restoring the first `k`
+/// heads from `repaired_heads`.
 #[derive(Clone, Debug, Serialize)]
 pub struct RepairResult {
     pub prompt: String,
@@ -13,6 +23,11 @@ pub struct RepairResult {
     pub repaired_heads: Vec<(usize, usize)>,
 }
 
+/// Restores f32 activations in the f16 model for the top-k important heads.
+///
+/// `importance_ranking` is prompt-specific and sorted from most important to
+/// least important. For each k, the f16 model is rerun with the first k f32
+/// head activations injected at the attention-output hook.
 pub fn compute_repair(
     model_f32: &HookedPythia,
     model_f16: &HookedPythia,
@@ -23,6 +38,9 @@ pub fn compute_repair(
     max_repair_k: usize,
 ) -> Result<RepairResult> {
     let input_ids = model_f32.tokenize(prompt)?;
+
+    // The f32 cache supplies the replacement tensors. The f16 cache gives the
+    // quantized baseline without any interventions.
     let f32_cache = model_f32.forward_with_cache(&input_ids)?;
     let f16_cache = model_f16.forward_with_cache(&input_ids)?;
 
@@ -33,6 +51,8 @@ pub fn compute_repair(
     let limit = max_repair_k.min(importance_ranking.len());
     let mut repair_curve = Vec::with_capacity(limit);
     for k in 1..=limit {
+        // Build a cumulative set of patches: k=3 restores the top three heads,
+        // not just the third head alone.
         let mut patches = Vec::with_capacity(k);
         for &(layer, head) in importance_ranking.iter().take(k) {
             patches.push(Patch {

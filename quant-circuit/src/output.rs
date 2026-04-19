@@ -1,9 +1,15 @@
+//! JSON output schema and persistence.
+//!
+//! These structs are the stable contract between the Rust experiment runner and
+//! `scripts/plot.py`.
+
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::path::Path;
 
 use crate::repair::RepairResult;
 
+/// Top-level experiment artifact written to `results/experiment.json`.
 #[derive(Clone, Debug, Serialize)]
 pub struct ExperimentOutput {
     pub model: String,
@@ -15,6 +21,7 @@ pub struct ExperimentOutput {
     pub metadata: Metadata,
 }
 
+/// Merged per-prompt data from importance, drift, and clean precision runs.
 #[derive(Clone, Debug, Serialize)]
 pub struct PromptResult {
     pub prompt: String,
@@ -28,6 +35,7 @@ pub struct PromptResult {
     pub clean_logit_diff_f16: f32,
 }
 
+/// Run-level bookkeeping that helps interpret or reproduce the output.
 #[derive(Clone, Debug, Serialize)]
 pub struct Metadata {
     pub timestamp: String,
@@ -36,6 +44,7 @@ pub struct Metadata {
     pub total_runtime_seconds: f32,
 }
 
+/// Writes the experiment output as pretty JSON, creating the parent directory.
 pub fn save_results(output: &ExperimentOutput, path: &str) -> Result<()> {
     let path = Path::new(path);
     if let Some(parent) = path.parent() {
